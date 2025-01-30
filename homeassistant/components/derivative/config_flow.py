@@ -27,6 +27,7 @@ from homeassistant.helpers.schema_config_entry_flow import (
 
 from .const import (
     CONF_ROUND_DIGITS,
+    CONF_STALE_TIME,
     CONF_TIME_WINDOW,
     CONF_UNIT_PREFIX,
     CONF_UNIT_TIME,
@@ -104,6 +105,7 @@ async def _get_options_dict(handler: SchemaCommonFlowHandler | None) -> dict:
                 options=TIME_UNITS, translation_key="time_unit"
             ),
         ),
+        vol.Optional(CONF_STALE_TIME): selector.DurationSelector(),
     }
 
 
