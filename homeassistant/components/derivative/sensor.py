@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, DecimalException
 import logging
 
+from attrs import define
 import voluptuous as vol
 
 from homeassistant.components.sensor import (
@@ -141,7 +142,7 @@ async def async_setup_platform(
         name=config.get(CONF_NAME),
         round_digits=config[CONF_ROUND_DIGITS],
         source_entity=config[CONF_SOURCE],
-        stale_time=config[CONF_STALE_TIME],
+        stale_time=config.get(CONF_STALE_TIME, {"seconds": 0}),
         time_window=config[CONF_TIME_WINDOW],
         unit_of_measurement=config.get(CONF_UNIT),
         unit_prefix=config[CONF_UNIT_PREFIX],
@@ -178,8 +179,7 @@ class DerivativeSensor(RestoreSensor, SensorEntity):
         self._sensor_source_id = source_entity
         self._round_digits = round_digits
         self._attr_native_value = round(Decimal(0), round_digits)
-        # List of tuples with (timestamp_start, timestamp_end, derivative)
-        self._state_list: list[tuple[datetime, datetime, Decimal]] = []
+        self._state_list: list[calculatedDerivative] = []
 
         self._attr_name = name if name is not None else f"{source_entity} derivative"
         self._attr_extra_state_attributes = {ATTR_SOURCE_ID: source_entity}
@@ -230,8 +230,7 @@ class DerivativeSensor(RestoreSensor, SensorEntity):
         stale: bool = False,
     ) -> None:
         """Update the state of the derivative sensor, depending on if it uses a time window or not and handle the stale timer."""
-        self._remove_old_derivatives(end)
-        self._state_list.append((begin, end, new_derivative))
+        self.update_state_list(begin, end, new_derivative)
 
         # If outside of time window (or there is no window) just report derivative (is the same as modeling it in the window),
         # otherwise take the weighted average with the previous derivatives
@@ -241,7 +240,7 @@ class DerivativeSensor(RestoreSensor, SensorEntity):
             derivative = self.calculate_sma()
 
         if self.timer and not stale:
-            self.timer()  # Cancel stale timer if it is already running
+            self.timer()  # Cancel stale timer if it is already running and state was updated before it expired
 
         # Run stale timer if requested unless the total derivative is 0, because the new derivative then wouldn't change anyway
         if self._has_stale_timer and derivative != 0:
@@ -281,7 +280,7 @@ class DerivativeSensor(RestoreSensor, SensorEntity):
     @callback
     def source_sensor_stale_state(self, now: datetime) -> None:
         """Handle the callbacks when the sensor doesn't update within the stale period."""
-        begin = self._state_list[-1][1]
+        begin = self._state_list[-1].end
         _LOGGER.debug(
             "%s has not updated in %s, setting derivative to 0 due to timeout",
             self._sensor_source_id,
@@ -329,29 +328,68 @@ class DerivativeSensor(RestoreSensor, SensorEntity):
         return derivative
 
     def calculate_sma(self) -> Decimal:
-        """Calculate the Simple Moving Average of the derivative. The time window is assumed to end with the last derivative in the list."""
+        """Calculate the Simple Moving Average of the derivative.
+
+        The time window is assumed to end with the last derivative in the list.
+        The start time is the end time minus the time window, or the first start time in the list.
+        """
         derivative = Decimal("0.00")
-        for start, end, value in self._state_list:
-            weight = self.calculate_weight(start, end, self._state_list[-1][1])
-            derivative = derivative + (value * Decimal(weight))
+        window_end = self._state_list[-1].end
+        time_window = timedelta(seconds=self._time_window)
+        window_start = window_end - time_window
+
+        # Solves edge cases where the time window is larger than the time between the first and last state
+        if window_start < self._state_list[0].start:
+            window_start = self._state_list[0].start
+            time_window = window_end - window_start
+
+        for item in self._state_list:
+            weight = self.calculate_weight(
+                item.start, item.end, time_window, window_start
+            )
+            derivative = derivative + (item.derivative * Decimal(weight))
         return derivative
 
-    def _remove_old_derivatives(self, current_time: datetime) -> None:
-        """Remove derivatives that are outside the time window."""
-        window_start = current_time - timedelta(seconds=self._time_window)
-        self._state_list = [
-            (start, end, value)
-            for start, end, value in self._state_list
-            if end >= window_start
-        ]
-
-    def calculate_weight(self, start: datetime, end: datetime, now: datetime) -> float:
+    def calculate_weight(
+        self,
+        start: datetime,
+        end: datetime,
+        time_window: timedelta,
+        window_start: datetime,
+    ) -> float:
         """Calculate the weight for a derivative based on its time range."""
-        window_start = now - timedelta(seconds=self._time_window)
+        window = time_window.total_seconds()
         if (
             start < window_start
         ):  # Start time is before the start of the window, only calculate the weight for the part inside the window
-            weight = (end - window_start).total_seconds() / self._time_window
+            weight = (end - window_start).total_seconds() / window
         else:
-            weight = (end - start).total_seconds() / self._time_window
+            weight = (end - start).total_seconds() / window
         return weight
+
+    def update_state_list(
+        self, start: datetime, end: datetime, derivative: Decimal
+    ) -> None:
+        """Update the state list removing derivatives out of the time window and adding the new one."""
+
+        # If the list is empty, add the first derivative without a start time, since we have no duration
+        if len(self._state_list) == 0:
+            self._state_list.append(calculatedDerivative(start, end, derivative))
+            return
+
+        # remove old derivatives
+        window_start = end - timedelta(seconds=self._time_window)
+        self._state_list = [
+            item for item in self._state_list if item.end >= window_start
+        ]
+
+        self._state_list.append(calculatedDerivative(start, end, derivative))
+
+
+@define
+class calculatedDerivative:
+    """A class to hold the value and times of a calculated derivative for use in calculating the SMA."""
+
+    start: datetime
+    end: datetime
+    derivative: Decimal
