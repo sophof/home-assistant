@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from decimal import Decimal, DecimalException
 import logging
@@ -24,7 +25,13 @@ from homeassistant.const import (
     STATE_UNKNOWN,
     UnitOfTime,
 )
-from homeassistant.core import Event, EventStateChangedData, HomeAssistant, callback
+from homeassistant.core import (
+    Event,
+    EventStateChangedData,
+    HomeAssistant,
+    State,
+    callback,
+)
 from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.device import async_device_info_to_link_from_entity
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -188,10 +195,10 @@ class DerivativeSensor(RestoreSensor, SensorEntity):
         self._unit_prefix = UNIT_PREFIXES[unit_prefix]
         self._unit_time = UNIT_TIME[unit_time]
         self._time_window = time_window.total_seconds()
-        self._stale_time = stale_time.total_seconds()
+        self._stale_time = stale_time.total_seconds() if stale_time else 0
         self._has_stale_timer = self._stale_time > 0
 
-        self.timer = None
+        self.timer: Callable | None = None
 
     async def async_added_to_hass(self) -> None:
         """Handle entity which will be added."""
@@ -215,7 +222,13 @@ class DerivativeSensor(RestoreSensor, SensorEntity):
             )
         )
 
-    def update_state(self, begin, end, new_derivative, stale=False):
+    def update_state(
+        self,
+        begin: datetime,
+        end: datetime,
+        new_derivative: Decimal,
+        stale: bool = False,
+    ) -> None:
         """Update the state of the derivative sensor, depending on if it uses a time window or not and handle the stale timer."""
         self._remove_old_derivatives(end)
         self._state_list.append((begin, end, new_derivative))
@@ -266,17 +279,21 @@ class DerivativeSensor(RestoreSensor, SensorEntity):
         )
 
     @callback
-    def source_sensor_stale_state(self, now) -> None:
+    def source_sensor_stale_state(self, now: datetime) -> None:
         """Handle the callbacks when the sensor doesn't update within the stale period."""
         begin = self._state_list[-1][1]
         _LOGGER.debug(
-            "%s has not updated in %s, setting derivative to 0",
+            "%s has not updated in %s, setting derivative to 0 due to timeout",
             self._sensor_source_id,
             now - begin,
         )
         self.update_state(begin, now, Decimal(0), stale=True)
 
-    def calculate_single_derivative(self, old_state, new_state) -> Decimal | None:
+    def calculate_single_derivative(
+        self,
+        old_state: State,
+        new_state: State,
+    ) -> Decimal | None:
         """Calculate the derivative based on old and new state and an assumed linear slope."""
         try:
             elapsed_time = (
